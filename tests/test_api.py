@@ -695,3 +695,252 @@ def test_rule_application_failure_leaves_no_partial_change(client):
     fetched = client.get(f"/merges/{mid}").json()
     assert fetched["revision"] == 1
     assert fetched["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# POST /merges — result_schema gate (JSON Schema Draft 2020-12)
+# ---------------------------------------------------------------------------
+
+INT_SCHEMA = {
+    "type": "object",
+    "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+    "required": ["a", "b"],
+}
+
+
+def test_invalid_result_schema_returns_422_and_creates_nothing(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 2},
+            "result_schema": {"type": "no-such-type"},
+        },
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["detail"].startswith("result_schema is not a valid JSON Schema")
+    # Every meta-schema error is reported with both pointers.
+    assert body["errors"]
+    err = body["errors"][0]
+    assert err["instance_path"] == "/type"
+    assert "schema_path" in err and err["message"]
+
+    # A non-object/non-boolean schema is invalid too.
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {},
+            "left": {},
+            "right": {},
+            "result_schema": "not-a-schema",
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_invalid_result_schema_rejected_even_for_idempotent_replay(client):
+    # An existing valid order is not replayed when the incoming schema is bad.
+    create_merge(client, key="schema-gate-key")
+    resp = client.post(
+        "/merges",
+        json={
+            "base": BASE,
+            "left": LEFT,
+            "right": RIGHT,
+            "idempotency_key": "schema-gate-key",
+            "result_schema": {"type": 42},
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_conflict_free_merge_must_satisfy_result_schema(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1},
+            "left": {"a": "oops"},
+            "right": {"a": "oops"},
+            "result_schema": INT_SCHEMA,
+        },
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["detail"] == "result document does not satisfy result_schema"
+    # All violations are reported; '/' sorts before '/a', find the type error.
+    by_path = {e["instance_path"]: e for e in body["errors"]}
+    assert by_path[""]["message"] == "'b' is a required property"
+    assert by_path["/a"]["schema_path"] == "/properties/a/type"
+
+    # No merge record was created for the rejected order.
+    # A conforming conflict-free merge is created resolved as usual.
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 5, "b": 6},
+            "right": {"a": 5, "b": 6},
+            "result_schema": INT_SCHEMA,
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "resolved"
+
+
+def test_partial_resolution_batch_is_not_validated(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 2},
+            "right": {"a": 3, "b": 3},
+            "result_schema": INT_SCHEMA,
+        },
+    )
+    mid = resp.json()["merge_id"]
+
+    # The document still carries a placeholder after this batch: no gate,
+    # even though the already-resolved /a value happens to be valid here.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": [{"pointer": "/a", "value": 10}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["revision"] == 2
+
+    # The final batch is gated: a bad /b rejects the whole batch.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 2, "resolutions": [{"pointer": "/b", "value": "nope"}]},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["errors"][0]["instance_path"] == "/b"
+
+    # Nothing was written: revision and the open conflict are unchanged.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 2
+    assert fetched["status"] == "pending"
+    assert [c["pointer"] for c in fetched["conflicts"]] == ["/b"]
+
+    # Retrying with a conforming value resolves the merge.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 2, "resolutions": [{"pointer": "/b", "value": 20}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "resolved"
+    assert body["result"] == {"a": 10, "b": 20}
+
+
+def test_result_schema_reports_all_errors_sorted(client):
+    schema = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "string"},
+            "b": {"type": "string"},
+        },
+        "required": ["a", "b"],
+    }
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 2},
+            "right": {"a": 3, "b": 3},
+            "result_schema": schema,
+        },
+    )
+    mid = resp.json()["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "value": 1},
+                {"pointer": "/b", "value": 2},
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    errors = resp.json()["errors"]
+    # All violations listed, deterministically ordered by instance_path.
+    assert [e["instance_path"] for e in errors] == ["/a", "/b"]
+    assert all(e["schema_path"] == "/properties/%s/type" % e["instance_path"][1]
+               for e in errors)
+
+
+def test_rule_resolutions_final_batch_is_gated(client):
+    # Rules resolving the last conflict produce a non-conforming result:
+    # the whole batch is rejected before any write.
+    bad = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1},
+            "left": {"a": 2},
+            "right": {"a": 3},
+            "result_schema": {"type": "object", "properties": {"a": {"const": 99}}},
+        },
+    ).json()
+    bad_mid = bad["merge_id"]
+    resp = client.post(
+        f"/merges/{bad_mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"right": "/**"}]},
+    )
+    assert resp.status_code == 422
+    err = resp.json()["errors"][0]
+    assert err["instance_path"] == "/a"
+    assert err["schema_path"] == "/properties/a/const"
+
+    # Atomic: revision holds, all conflicts stay open.
+    fetched = client.get(f"/merges/{bad_mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert [c["pointer"] for c in fetched["conflicts"]] == ["/a"]
+
+    # A rule batch that matches nothing is not gated: no write, revision
+    # holds, and the response is a normal 200 no-op.
+    resp = client.post(
+        f"/merges/{bad_mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"left": "/elsewhere"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["applied"] is False
+    assert resp.json()["revision"] == 1
+
+
+def test_rule_resolutions_conforming_final_batch_resolves(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 2},
+            "right": {"a": 3, "b": 3},
+            "result_schema": INT_SCHEMA,
+        },
+    )
+    mid = resp.json()["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/rule-resolutions",
+        json={"revision": 1, "rules": [{"right": "/**"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "resolved"
+    assert resp.json()["result"] == {"a": 3, "b": 3}
+
+
+def test_merge_without_result_schema_is_ungated(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1},
+            "left": {"a": "whatever"},
+            "right": {"a": "whatever"},
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["result"] == {"a": "whatever"}

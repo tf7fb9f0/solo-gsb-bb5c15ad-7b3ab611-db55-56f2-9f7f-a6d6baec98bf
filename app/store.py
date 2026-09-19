@@ -10,6 +10,7 @@ from typing import Any
 from . import db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .validation import compile_schema, validate_result
 from .rules import (
     InvalidPattern,
     InvalidRuleSet,
@@ -103,13 +104,23 @@ def get_merge_patch(merge_id: str) -> dict:
 
 
 def create_merge(
-    base: Any, left: Any, right: Any, idempotency_key: str | None
+    base: Any,
+    left: Any,
+    right: Any,
+    idempotency_key: str | None,
+    result_schema: Any = None,
 ) -> tuple[dict, bool]:
     """Create a merge order. Returns (merge_view, created).
 
     A repeated idempotency key replays the existing merge order instead of
-    creating a new one.
+    creating a new one. When ``result_schema`` is given it is first checked
+    against the Draft 2020-12 meta-schema (InvalidResultSchema -> 422, no
+    record created); a conflict-free result must satisfy it as well.
     """
+    # Validate the schema itself before touching any state, so an invalid
+    # schema is rejected even when the idempotency key replays an order.
+    validator = compile_schema(result_schema) if result_schema is not None else None
+
     if idempotency_key:
         row = db.query_one(
             "SELECT * FROM merges WHERE idempotency_key = ?", (idempotency_key,)
@@ -120,8 +131,14 @@ def create_merge(
     document, conflicts = merge3(base, left, right)
     now = _now()
     status = STATUS_RESOLVED if not conflicts else STATUS_PENDING
-    # No conflicts: the result is final and immutable from the start.
-    result = document if not conflicts else None
+    # No conflicts: the result is final and immutable from the start, so it
+    # must pass the gate immediately; failure leaves no record behind.
+    if not conflicts:
+        if validator is not None:
+            validate_result(validator, document)
+        result = document
+    else:
+        result = None
 
     merge_id = uuid.uuid4().hex
     try:
@@ -130,8 +147,9 @@ def create_merge(
             INSERT INTO merges (
                 id, idempotency_key, status, revision,
                 base_doc, left_doc, right_doc,
-                document, conflicts, result, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                document, conflicts, result, result_schema,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merge_id,
@@ -144,6 +162,7 @@ def create_merge(
                 json.dumps(document),
                 json.dumps(conflicts),
                 json.dumps(result) if result is not None else None,
+                json.dumps(result_schema) if result_schema is not None else None,
                 now,
                 now,
             ),
@@ -158,6 +177,16 @@ def create_merge(
                 return _row_to_dict(row), False
         raise
     return get_merge(merge_id), True
+
+
+def _row_validator(row):
+    """Build the Draft 2020-12 validator stored on the row, if any.
+
+    The stored schema was meta-validated at creation time, so compiling it
+    cannot fail here.
+    """
+    raw = row["result_schema"]
+    return compile_schema(json.loads(raw)) if raw is not None else None
 
 
 def _apply_batch(
@@ -216,6 +245,13 @@ def apply_resolutions(
         json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
     )
     resolved = not remaining
+    # The gate only applies once the candidate document is a real result:
+    # partial batches leave placeholders behind and are never checked. A
+    # failure raises before the UPDATE: nothing is written, revision holds.
+    if resolved:
+        validator = _row_validator(row)
+        if validator is not None:
+            validate_result(validator, document)
     db.execute(
         """
         UPDATE merges
@@ -318,6 +354,14 @@ def apply_rule_resolutions(
 
     document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
     resolved = not remaining
+
+    # As with explicit resolutions, the gate runs only for a batch that
+    # resolves the final conflict, after all hits have proven applicable but
+    # before any write: a rejecting schema fails the whole batch atomically.
+    if resolved:
+        validator = _row_validator(row)
+        if validator is not None:
+            validate_result(validator, document)
 
     # Single atomic update: revision increments exactly once.
     db.execute(

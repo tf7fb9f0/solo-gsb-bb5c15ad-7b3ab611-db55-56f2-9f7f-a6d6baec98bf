@@ -1,6 +1,6 @@
 # 配置变更三方合并 API
 
-基于 **Python + FastAPI + SQLite** 的配置三方合并服务。客户端提交 `base`（共同祖先）、`left`、`right` 三份 JSON，服务按 JSON Pointer 递归合并对象：单侧修改自动采用、双侧同值修改自动合并、双侧不同修改在冲突处保留占位符并返回双方候选。客户端携带当前 `revision` 分批提交冲突取值，全部解决后生成**不可变**结果。
+基于 **Python + FastAPI + SQLite** 的配置三方合并服务。客户端提交 `base`（共同祖先）、`left`、`right` 三份 JSON，服务按 JSON Pointer 递归合并对象：单侧修改自动采用、双侧同值修改自动合并、双侧不同修改在冲突处保留占位符并返回双方候选。客户端携带当前 `revision` 分批提交冲突取值，全部解决后生成**不可变**结果。创建合并单时可选提供一份 [JSON Schema（Draft 2020-12）](https://json-schema.org/draft/2020-12/json-schema-core) 作为最终结果门禁：schema 本身先校验，候选最终结果必须通过校验方可落库。
 
 ## 快速启动（单条命令）
 
@@ -40,7 +40,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键） |
+| `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键，可选 `result_schema` 结果门禁） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
@@ -85,6 +85,75 @@ curl -s -X POST http://localhost:8000/merges \
 
 无冲突的合并单创建即 `resolved`，`result` 立即可用且不可变。
 
+### 1.1 最终结果 JSON Schema 门禁 — `result_schema`
+
+`POST /merges` 可在请求体中可选携带 `result_schema`（[Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core)；也接受 `true` / `false` 布尔 schema）。门禁规则：
+
+1. **先校验 schema 本身**：服务按 Draft 2020-12 元 schema 校验 `result_schema`，非法（如未知 `type`、`required` 不是数组）直接返回 **`422`，不创建任何记录**（即使命中幂等键也优先返回 422）。
+2. **无冲突的初始合并**：创建时即可定版，候选结果必须通过 schema；失败返回 **`422`，不创建记录**。
+3. **有冲突的合并**：创建时仅保存 schema（工作文档仍含占位符，不校验）；对 `resolutions` 与 `rule-resolutions`，**仅当本批次将解决最后一个冲突**时，才把无占位符的候选最终结果交给 schema 校验：
+   - 校验失败 → **`422`**，按 `instance_path`、`schema_path` 稳定排序后列出**全部**错误，**整批不写入、`revision` 不变、冲突列表不变**；
+   - 只解决部分冲突的批次（文档仍带占位符）**不校验**，照常提交并递增 `revision`。
+
+携带 `result_schema` 创建并一次通过的请求示例：
+
+```bash
+curl -s -X POST http://localhost:8000/merges \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"replicas": 1, "db": {"host": "a", "port": 5432}},
+    "left":  {"replicas": 3, "db": {"host": "b", "port": 5432}},
+    "right": {"replicas": 1, "db": {"host": "c", "port": 5433}},
+    "result_schema": {
+      "type": "object",
+      "required": ["replicas", "db"],
+      "properties": {
+        "replicas": {"type": "integer", "minimum": 1},
+        "db": {
+          "type": "object",
+          "required": ["host", "port"],
+          "properties": {
+            "host": {"type": "string", "minLength": 1},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        }
+      }
+    }
+  }'
+```
+
+非法 schema 的 `422` 响应（错误项均为 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointer 路径）：
+
+```json
+{
+  "detail": "result_schema is not a valid JSON Schema (Draft 2020-12)",
+  "errors": [
+    {
+      "instance_path": "/type",
+      "schema_path": "/allOf/3/properties/type/anyOf",
+      "message": "'nope' is not valid under any of the given schemas"
+    }
+  ]
+}
+```
+
+候选最终结果不满足 schema 的 `422` 响应（全部错误，按 `instance_path` 再按 `schema_path` 升序）：
+
+```json
+{
+  "detail": "result document does not satisfy result_schema",
+  "errors": [
+    {
+      "instance_path": "/db/port",
+      "schema_path": "/properties/db/properties/port/type",
+      "message": "'five-four-three-two' is not of type 'integer'"
+    }
+  ]
+}
+```
+
+随后用合法取值重提同一批次（携带相同 `revision`）即可成功。`POST /merges/{merge_id}/resolution-preview` 不做 schema 门禁，始终只在内存副本上预演。
+
 ### 2. 状态查询 — `GET /merges/{merge_id}`
 
 ```bash
@@ -110,6 +179,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 
 - **revision 过期 → `409`**：请求中的 `revision` 必须与当前一致（创建时为 1，每接受一批 +1）。过期时响应体携带 `current_revision`，客户端重新拉取状态后重试。
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
+- 若合并单携带了 `result_schema`，**解决最后一个冲突的批次**还会把候选最终结果交给 schema 校验：失败返回 **`422`**（响应含按 `instance_path`、`schema_path` 排序的全部错误），整批不写入、`revision` 不变；只解决部分冲突的批次因文档仍含占位符而不校验。
 - 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
 
 ### 4. 预演冲突解决 — `POST /merges/{merge_id}/resolution-preview`
@@ -209,6 +279,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/ru
 - **缺失侧沿用删除语义**：规则选中的一侧若处于删除态（冲突的 `missing` 中含该侧），则删除对应键；若缺失的是文档根本身（无法删除），整批 `400`。
 - **未匹配冲突**原样保留并通过 `unmatched_conflicts` 返回；它们不阻塞其余命中项的提交，但会使合并单继续处于 `pending`。
 - **一条都没命中**时不写入、不递增 revision（响应中 `applied: false`）；这不算错误，返回 `200`。
+- 若合并单携带了 `result_schema`，**命中项将解决全部剩余冲突**（结果中不再有占位符）时还会校验候选最终结果；失败返回 **`422`**（全部错误按 `instance_path`、`schema_path` 排序），整批不写入、`revision` 不变。仍有未匹配冲突的部分批次不校验。
 - **revision 过期 → `409`**（响应体携带 `current_revision`）；合并单已 `resolved` 后同样 `409`；合并单不存在 → `404`。
 
 ### 6. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
@@ -261,7 +332,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（72 项）
+python -m pytest tests/ -q                  # 运行测试（80 项）
 ```
 
 ## 项目结构
@@ -273,7 +344,8 @@ app/
   rules.py   # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   patch.py   # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   store.py   # 合并单状态机：revision 校验、冲突解决、不可变结果
-  db.py      # SQLite 连接与建表（启动时执行）
+  validation.py # JSON Schema Draft 2020-12：schema 自检与最终结果门禁（422）
+  db.py      # SQLite 连接与建表（启动时执行，含 result_schema 列迁移）
   models.py  # Pydantic 请求模型
 tests/       # 合并引擎/补丁单测 + API 端到端测试
 Dockerfile

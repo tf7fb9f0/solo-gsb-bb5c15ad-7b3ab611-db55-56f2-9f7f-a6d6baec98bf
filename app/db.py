@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS merges (
     document        TEXT NOT NULL,
     conflicts       TEXT NOT NULL,
     result          TEXT,
+    result_schema   TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -43,8 +44,14 @@ def connect() -> sqlite3.Connection:
 
 def init_schema() -> None:
     with _lock:
-        connect().executescript(SCHEMA)
-        connect().commit()
+        conn = connect()
+        conn.executescript(SCHEMA)
+        # Lightweight migration for databases created before result_schema.
+        if "result_schema" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(merges)")
+        }:
+            conn.execute("ALTER TABLE merges ADD COLUMN result_schema TEXT")
+        conn.commit()
 
 
 def execute(query: str, params: tuple = ()) -> sqlite3.Cursor:

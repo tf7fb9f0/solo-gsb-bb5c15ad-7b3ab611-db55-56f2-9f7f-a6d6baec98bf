@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from . import db, store
 from .models import MergeCreate, ResolveRequest, RuleResolveRequest
+from .validation import InvalidResultSchema, ResultValidationFailed
 
 
 @asynccontextmanager
@@ -93,6 +94,30 @@ async def rule_apply_failed_handler(request: Request, exc: store.RuleApplication
     )
 
 
+@app.exception_handler(InvalidResultSchema)
+async def invalid_result_schema_handler(request: Request, exc: InvalidResultSchema):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "result_schema is not a valid JSON Schema (Draft 2020-12)",
+            "errors": exc.errors,
+        },
+    )
+
+
+@app.exception_handler(ResultValidationFailed)
+async def result_validation_failed_handler(
+    request: Request, exc: ResultValidationFailed
+):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "result document does not satisfy result_schema",
+            "errors": exc.errors,
+        },
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -110,7 +135,9 @@ def create_merge(
     order (HTTP 200) instead of creating a new one.
     """
     key = body.idempotency_key or idempotency_key
-    view, created = store.create_merge(body.base, body.left, body.right, key)
+    view, created = store.create_merge(
+        body.base, body.left, body.right, key, body.result_schema
+    )
     if not created:
         response.status_code = 200
     return view
