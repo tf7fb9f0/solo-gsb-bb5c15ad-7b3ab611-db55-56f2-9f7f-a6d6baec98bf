@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS merges (
     document        TEXT NOT NULL,
     conflicts       TEXT NOT NULL,
     result          TEXT,
+    result_schema   TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -41,10 +42,23 @@ def connect() -> sqlite3.Connection:
     return _conn
 
 
+# Columns added after the initial release; applied to database files that
+# predate them so an existing Docker volume keeps working.
+_MIGRATIONS = (
+    "ALTER TABLE merges ADD COLUMN result_schema TEXT",
+)
+
+
 def init_schema() -> None:
     with _lock:
-        connect().executescript(SCHEMA)
-        connect().commit()
+        conn = connect()
+        conn.executescript(SCHEMA)
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(merges)")}
+        for statement in _MIGRATIONS:
+            column = statement.split("ADD COLUMN", 1)[1].split()[0]
+            if column not in existing:
+                conn.execute(statement)
+        conn.commit()
 
 
 def execute(query: str, params: tuple = ()) -> sqlite3.Cursor:

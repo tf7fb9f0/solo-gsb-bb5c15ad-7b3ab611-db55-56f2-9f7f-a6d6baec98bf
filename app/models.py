@@ -11,6 +11,14 @@ class MergeCreate(BaseModel):
     base: Any = Field(..., description="Common ancestor JSON document")
     left: Any = Field(..., description="Left side JSON document")
     right: Any = Field(..., description="Right side JSON document")
+    result_schema: Any | None = Field(
+        default=None,
+        description=(
+            "Optional Draft 2020-12 JSON Schema gating the final result. "
+            "Validated against the meta-schema on creation; the resolved "
+            "document must satisfy it."
+        ),
+    )
     idempotency_key: str | None = Field(
         default=None,
         description="Optional key; may also be sent as the Idempotency-Key header",

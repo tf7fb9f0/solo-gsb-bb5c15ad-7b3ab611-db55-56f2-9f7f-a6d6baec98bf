@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from . import db, store
 from .models import MergeCreate, ResolveRequest, RuleResolveRequest
+from .validation import InvalidResultSchema, ResultValidationFailed
 
 
 @asynccontextmanager
@@ -93,6 +94,32 @@ async def rule_apply_failed_handler(request: Request, exc: store.RuleApplication
     )
 
 
+@app.exception_handler(InvalidResultSchema)
+async def invalid_result_schema_handler(request: Request, exc: InvalidResultSchema):
+    # The result_schema supplied to POST /merges is not itself a valid
+    # Draft 2020-12 JSON Schema: 422, and no merge record was created.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "invalid result_schema: not a valid JSON Schema (Draft 2020-12)",
+            "errors": exc.errors,
+        },
+    )
+
+
+@app.exception_handler(ResultValidationFailed)
+async def result_validation_failed_handler(request: Request, exc: ResultValidationFailed):
+    # The candidate final document violates the merge's result_schema:
+    # 422, the whole batch was rolled back and the revision is unchanged.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "final result does not satisfy result_schema",
+            "errors": exc.errors,
+        },
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -110,7 +137,9 @@ def create_merge(
     order (HTTP 200) instead of creating a new one.
     """
     key = body.idempotency_key or idempotency_key
-    view, created = store.create_merge(body.base, body.left, body.right, key)
+    view, created = store.create_merge(
+        body.base, body.left, body.right, key, body.result_schema
+    )
     if not created:
         response.status_code = 200
     return view

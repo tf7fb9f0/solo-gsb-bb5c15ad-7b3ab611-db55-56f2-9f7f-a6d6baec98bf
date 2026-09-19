@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-依赖安装（镜像构建时）与 SQLite 建表（应用启动时）自动完成，无需任何额外步骤。
+依赖安装（镜像构建时，含 `jsonschema` Draft 2020-12 校验）与 SQLite 建表（应用启动时）自动完成，无需任何额外步骤。
 
 - **API 地址**：http://localhost:8000
 - **交互式文档（Swagger UI）**：http://localhost:8000/docs
@@ -40,11 +40,11 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键） |
+| `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键、可选 `result_schema` 门禁） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
-| `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
+| `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值（最后一批须通过 schema 门禁） |
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
-| `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突 |
+| `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
@@ -85,6 +85,57 @@ curl -s -X POST http://localhost:8000/merges \
 
 无冲突的合并单创建即 `resolved`，`result` 立即可用且不可变。
 
+#### 最终结果门禁：`result_schema`（可选）
+
+创建合并单时可在请求体中携带 `result_schema`，一个遵循 [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12) 的 JSON Schema，用于约束**不可变最终结果**：
+
+1. **先校验 schema 本身**：服务按 Draft 2020-12 元 schema 校验 `result_schema`。schema 不合法（如 `{"type": "whatever"}`、`required` 不是数组、非法正则等）→ **`422`**，响应体按 `instance_path`、`schema_path` 稳定排序列出**全部**元 schema 错误，且**不创建任何记录**（幂等键仍可再次使用）。
+2. **无冲突的初始合并也必须通过**：三份文档合并后若不存在冲突，合并单创建即 `resolved`，此时立即用 schema 校验合并结果；不通过 → **`422`**、不落库。
+3. **存在冲突时创建不校验**：工作文档还带着冲突占位符，门禁延后到冲突解决时生效。
+
+```bash
+curl -s -X POST http://localhost:8000/merges \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base":  {"replicas": 1, "db": {"host": "a", "port": 5432}},
+    "left":  {"replicas": 3, "db": {"host": "b", "port": 5432}},
+    "right": {"replicas": 1, "db": {"host": "c", "port": 5433}},
+    "result_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["replicas", "db"],
+      "properties": {
+        "replicas": {"type": "integer", "minimum": 1},
+        "db": {
+          "type": "object",
+          "required": ["host", "port"],
+          "properties": {
+            "host": {"type": "string", "minLength": 1},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+          }
+        }
+      }
+    }
+  }'
+```
+
+非法 schema 的 `422` 响应（`instance_path` 指向被提交 schema 内的位置；`schema_path` 指向违反的元 schema 关键字）：
+
+```json
+{
+  "detail": "invalid result_schema: not a valid JSON Schema (Draft 2020-12)",
+  "errors": [
+    {
+      "instance_path": "/type",
+      "schema_path": "/allOf/3/properties/type/anyOf",
+      "message": "'whatever' is not valid under any of the given schemas"
+    }
+  ]
+}
+```
+
+布尔 schema（`true` / `false`）也是合法的 Draft 2020-12 schema：`false` 表示任何最终结果都不被接受（只能用于存在冲突的合并单，否则创建即 `422`）。未携带 `result_schema` 时行为与以前完全一致。
+
 ### 2. 状态查询 — `GET /merges/{merge_id}`
 
 ```bash
@@ -109,8 +160,24 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 ```
 
 - **revision 过期 → `409`**：请求中的 `revision` 必须与当前一致（创建时为 1，每接受一批 +1）。过期时响应体携带 `current_revision`，客户端重新拉取状态后重试。
+- **`result_schema` 门禁**：仅当本批将解决**最后一个**冲突（产生最终结果）时，才用创建合并单时携带的 schema 校验候选结果；**部分解决**的批次仍留着占位符文档，不做校验。最终批次校验失败 → **`422`**，响应体按 `instance_path`、`schema_path` 稳定排序列出全部违规（每条含 `instance_path`、`schema_path`、`message`），**整批不写入、revision 不变、冲突列表保持原样**，可修正取值后用原 revision 重试。
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
 - 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
+
+例如 schema 要求 `/db/host` 为字符串时，最终批次若给出整数会得到：
+
+```json
+{
+  "detail": "final result does not satisfy result_schema",
+  "errors": [
+    {
+      "instance_path": "/db/host",
+      "schema_path": "/properties/db/properties/host/type",
+      "message": "5432 is not of type 'string'"
+    }
+  ]
+}
+```
 
 ### 4. 预演冲突解决 — `POST /merges/{merge_id}/resolution-preview`
 
@@ -206,6 +273,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/ru
 ```
 
 - **先整批校验，再一次事务提交**：先编译全部模式、为每个冲突选定唯一规则，并验证所有命中项都可应用；只有全部通过时才在**单条 UPDATE 事务**中写入，`revision` 恰好 **+1**。任何非法模式、缺少 `left`/`right` 的规则、或任一命中项应用失败，整批 **`400`**，**不会产生任何部分修改**（revision 与冲突列表保持原样）。
+- **`result_schema` 门禁同显式取值**：仅当本批将解决最后一个冲突（所有冲突均被命中且应用后无剩余）时才校验候选最终结果；部分命中（仍有 `unmatched_conflicts`）或一条都未命中（`applied: false`）不校验。校验失败 → **`422`**，全部违规按 `instance_path`、`schema_path` 稳定排序返回，整批不写入、`revision` 不变。
 - **缺失侧沿用删除语义**：规则选中的一侧若处于删除态（冲突的 `missing` 中含该侧），则删除对应键；若缺失的是文档根本身（无法删除），整批 `400`。
 - **未匹配冲突**原样保留并通过 `unmatched_conflicts` 返回；它们不阻塞其余命中项的提交，但会使合并单继续处于 `pending`。
 - **一条都没命中**时不写入、不递增 revision（响应中 `applied: false`）；这不算错误，返回 `200`。
@@ -261,21 +329,22 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（72 项）
+python -m pytest tests/ -q                  # 运行测试（87 项）
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py    # FastAPI 路由与错误映射（404/409/400）
-  merge.py   # 纯 Python 三方合并引擎（JSON Pointer 递归）
-  rules.py   # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
-  patch.py   # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
-  store.py   # 合并单状态机：revision 校验、冲突解决、不可变结果
-  db.py      # SQLite 连接与建表（启动时执行）
-  models.py  # Pydantic 请求模型
-tests/       # 合并引擎/补丁单测 + API 端到端测试
+  main.py       # FastAPI 路由与错误映射（404/409/400/422）
+  merge.py      # 纯 Python 三方合并引擎（JSON Pointer 递归）
+  rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
+  patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
+  validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
+  store.py      # 合并单状态机：revision 校验、冲突解决、不可变结果、schema 门禁
+  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移）
+  models.py     # Pydantic 请求模型（含可选 result_schema）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

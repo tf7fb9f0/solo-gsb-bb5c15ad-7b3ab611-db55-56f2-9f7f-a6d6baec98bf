@@ -10,6 +10,7 @@ from typing import Any
 from . import db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
+from .validation import check_result_schema, validate_result
 from .rules import (
     InvalidPattern,
     InvalidRuleSet,
@@ -103,12 +104,19 @@ def get_merge_patch(merge_id: str) -> dict:
 
 
 def create_merge(
-    base: Any, left: Any, right: Any, idempotency_key: str | None
+    base: Any,
+    left: Any,
+    right: Any,
+    idempotency_key: str | None,
+    result_schema: Any = None,
 ) -> tuple[dict, bool]:
     """Create a merge order. Returns (merge_view, created).
 
     A repeated idempotency key replays the existing merge order instead of
-    creating a new one.
+    creating a new one. When ``result_schema`` is given it must itself be a
+    valid Draft 2020-12 JSON Schema, and a conflict-free (immediately
+    resolved) merge must produce a document satisfying it; either failure
+    aborts creation before any row is inserted.
     """
     if idempotency_key:
         row = db.query_one(
@@ -117,10 +125,17 @@ def create_merge(
         if row is not None:
             return _row_to_dict(row), False
 
+    # Gate 1: the schema itself must be a valid Draft 2020-12 schema.
+    if result_schema is not None:
+        check_result_schema(result_schema)
+
     document, conflicts = merge3(base, left, right)
     now = _now()
     status = STATUS_RESOLVED if not conflicts else STATUS_PENDING
-    # No conflicts: the result is final and immutable from the start.
+    # No conflicts: the result is final and immutable from the start, so it
+    # must pass the result schema (gate 2) before anything is persisted.
+    if not conflicts and result_schema is not None:
+        validate_result(result_schema, document)
     result = document if not conflicts else None
 
     merge_id = uuid.uuid4().hex
@@ -130,8 +145,9 @@ def create_merge(
             INSERT INTO merges (
                 id, idempotency_key, status, revision,
                 base_doc, left_doc, right_doc,
-                document, conflicts, result, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                document, conflicts, result, result_schema,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merge_id,
@@ -144,6 +160,7 @@ def create_merge(
                 json.dumps(document),
                 json.dumps(conflicts),
                 json.dumps(result) if result is not None else None,
+                json.dumps(result_schema) if result_schema is not None else None,
                 now,
                 now,
             ),
@@ -216,6 +233,11 @@ def apply_resolutions(
         json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
     )
     resolved = not remaining
+    # Gate: only a batch that resolves the last conflict produces a final
+    # document, so only that batch is validated. A partial batch still
+    # carries conflict placeholders and is committed unchecked.
+    if resolved and row["result_schema"] is not None:
+        validate_result(json.loads(row["result_schema"]), document)
     db.execute(
         """
         UPDATE merges
@@ -318,6 +340,10 @@ def apply_rule_resolutions(
 
     document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
     resolved = not remaining
+    # Same gate as explicit resolutions: only the batch that resolves the
+    # very last conflict is checked against the final-result schema.
+    if resolved and row["result_schema"] is not None:
+        validate_result(json.loads(row["result_schema"]), document)
 
     # Single atomic update: revision increments exactly once.
     db.execute(
